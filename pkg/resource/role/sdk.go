@@ -171,15 +171,13 @@ func (rm *resourceManager) sdkFind(
 			ko.Spec.AssumeRolePolicyDocument = &doc
 		}
 	}
-	if policies, err := rm.getPolicies(ctx, &resource{ko}); err != nil {
+	ko.Spec.Policies, err = rm.getPolicies(ctx, &resource{ko})
+	if err != nil {
 		return nil, err
-	} else {
-		ko.Spec.Policies = policies
 	}
-	if tags, err := rm.getTags(ctx, &resource{ko}); err != nil {
+	ko.Spec.Tags, err = rm.getTags(ctx, &resource{ko})
+	if err != nil {
 		return nil, err
-	} else {
-		ko.Spec.Tags = tags
 	}
 	return &resource{ko}, nil
 }
@@ -320,13 +318,7 @@ func (rm *resourceManager) sdkCreate(
 			ko.Spec.AssumeRolePolicyDocument = &doc
 		}
 	}
-	if err := rm.syncPolicies(ctx, &resource{ko}); err != nil {
-		return nil, err
-	}
-	// There really isn't a status of a role... it either exists or doesn't. If
-	// we get here, that means the creation was successful and the desired
-	// state of the role matches what we provided...
-	ackcondition.SetSynced(&resource{ko}, corev1.ConditionTrue, nil, nil)
+	ackcondition.SetSynced(&resource{ko}, corev1.ConditionFalse, nil, nil)
 
 	return &resource{ko}, nil
 }
@@ -382,62 +374,8 @@ func (rm *resourceManager) sdkUpdate(
 	desired *resource,
 	latest *resource,
 	delta *ackcompare.Delta,
-) (updated *resource, err error) {
-	rlog := ackrtlog.FromContext(ctx)
-	exit := rlog.Trace("rm.sdkUpdate")
-	defer func() {
-		exit(err)
-	}()
-	input, err := rm.newUpdateRequestPayload(ctx, desired)
-	if err != nil {
-		return nil, err
-	}
-
-	var resp *svcsdk.UpdateRoleOutput
-	_ = resp
-	resp, err = rm.sdkapi.UpdateRoleWithContext(ctx, input)
-	rm.metrics.RecordAPICall("UPDATE", "UpdateRole", err)
-	if err != nil {
-		return nil, err
-	}
-	// Merge in the information we read from the API call above to the copy of
-	// the original Kubernetes object we passed to the function
-	ko := desired.ko.DeepCopy()
-
-	rm.setStatusDefaults(ko)
-	if err := rm.syncPolicies(ctx, &resource{ko}); err != nil {
-		return nil, err
-	}
-	if err := rm.syncTags(ctx, &resource{ko}); err != nil {
-		return nil, err
-	}
-	// There really isn't a status of a role... it either exists or doesn't. If
-	// we get here, that means the update was successful and the desired state
-	// of the role matches what we provided...
-	ackcondition.SetSynced(&resource{ko}, corev1.ConditionTrue, nil, nil)
-
-	return &resource{ko}, nil
-}
-
-// newUpdateRequestPayload returns an SDK-specific struct for the HTTP request
-// payload of the Update API call for the resource
-func (rm *resourceManager) newUpdateRequestPayload(
-	ctx context.Context,
-	r *resource,
-) (*svcsdk.UpdateRoleInput, error) {
-	res := &svcsdk.UpdateRoleInput{}
-
-	if r.ko.Spec.Description != nil {
-		res.SetDescription(*r.ko.Spec.Description)
-	}
-	if r.ko.Spec.MaxSessionDuration != nil {
-		res.SetMaxSessionDuration(*r.ko.Spec.MaxSessionDuration)
-	}
-	if r.ko.Spec.Name != nil {
-		res.SetRoleName(*r.ko.Spec.Name)
-	}
-
-	return res, nil
+) (*resource, error) {
+	return rm.customUpdateRole(ctx, desired, latest, delta)
 }
 
 // sdkDelete deletes the supplied resource in the backend AWS service API
@@ -451,11 +389,10 @@ func (rm *resourceManager) sdkDelete(
 		exit(err)
 	}()
 	// This causes syncPolicies to delete all associated policies from the role
-	r.ko.Spec.Policies = []*string{}
-	if err := rm.syncPolicies(ctx, r); err != nil {
+	rWithNoPolicies := &resource{ko: &svcapitypes.Role{}}
+	if err := rm.syncPolicies(ctx, r, rWithNoPolicies); err != nil {
 		return nil, err
 	}
-
 	input, err := rm.newDeleteRequestPayload(r)
 	if err != nil {
 		return nil, err
@@ -594,4 +531,37 @@ func (rm *resourceManager) terminalAWSError(err error) bool {
 	default:
 		return false
 	}
+}
+
+// getImmutableFieldChanges returns list of immutable fields from the
+func (rm *resourceManager) getImmutableFieldChanges(
+	delta *ackcompare.Delta,
+) []string {
+	var fields []string
+	if delta.DifferentAt("Spec.Name") {
+		fields = append(fields, "Name")
+	}
+
+	return fields
+}
+
+// newUpdateRequestPayload returns an SDK-specific struct for the HTTP request
+// payload of the Update API call for the resource
+func (rm *resourceManager) newUpdateRequestPayload(
+	ctx context.Context,
+	r *resource,
+) *svcsdk.UpdateRoleInput {
+	res := &svcsdk.UpdateRoleInput{}
+
+	if r.ko.Spec.Description != nil {
+		res.SetDescription(*r.ko.Spec.Description)
+	}
+	if r.ko.Spec.MaxSessionDuration != nil {
+		res.SetMaxSessionDuration(*r.ko.Spec.MaxSessionDuration)
+	}
+	if r.ko.Spec.Name != nil {
+		res.SetRoleName(*r.ko.Spec.Name)
+	}
+
+	return res
 }

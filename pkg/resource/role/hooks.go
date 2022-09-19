@@ -17,12 +17,120 @@ import (
 	"context"
 	"net/url"
 
+	ackcompare "github.com/aws-controllers-k8s/runtime/pkg/compare"
 	ackrtlog "github.com/aws-controllers-k8s/runtime/pkg/runtime/log"
 	ackutil "github.com/aws-controllers-k8s/runtime/pkg/util"
+	"github.com/aws/aws-sdk-go/aws"
 	svcsdk "github.com/aws/aws-sdk-go/service/iam"
 
 	svcapitypes "github.com/aws-controllers-k8s/iam-controller/apis/v1alpha1"
 )
+
+// customUpdateRole patches each of the resource properties in the backend AWS
+// service API and returns a new resource with updated fields.
+func (rm *resourceManager) customUpdateRole(
+	ctx context.Context,
+	desired *resource,
+	latest *resource,
+	delta *ackcompare.Delta,
+) (*resource, error) {
+	var err error
+	rlog := ackrtlog.FromContext(ctx)
+	exit := rlog.Trace("rm.customUpdateRole")
+	defer exit(err)
+
+	if delta.DifferentAt("Spec.Policies") {
+		err = rm.syncPolicies(ctx, desired, latest)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if delta.DifferentAt("Spec.Tags") {
+		err = rm.syncTags(ctx, desired, latest)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if delta.DifferentAt("Spec.PermissionsBoundary") {
+		err = rm.updateRolePermissionsBoundary(ctx, desired)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if delta.DifferentExcept("Spec.Tags", "Spec.Policies") {
+		err = rm.updateRole(ctx, desired)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return nil, nil
+}
+
+func (rm *resourceManager) updateRole(
+	ctx context.Context,
+	r *resource,
+) (err error) {
+	rlog := ackrtlog.FromContext(ctx)
+	exit := rlog.Trace("rm.updateRole")
+	defer func() {
+		exit(err)
+	}()
+	input := rm.newUpdateRequestPayload(ctx, r)
+	_, err = rm.sdkapi.UpdateRoleWithContext(ctx, input)
+	rm.metrics.RecordAPICall("UPDATE", "UpdateRole", err)
+	return err
+}
+
+func (rm *resourceManager) updateRolePermissionsBoundary(
+	ctx context.Context,
+	r *resource,
+) (err error) {
+	rlog := ackrtlog.FromContext(ctx)
+	exit := rlog.Trace("rm.updateRolePermissionsBoundary")
+	defer func() {
+		exit(err)
+	}()
+	if r.ko.Spec.PermissionsBoundary == nil || *r.ko.Spec.PermissionsBoundary == "" {
+		return rm.deleteRolePermissionsBoundary(ctx, r)
+	}
+
+	input := &svcsdk.PutRolePermissionsBoundaryInput{
+		RoleName:            aws.String(*r.ko.Spec.Name),
+		PermissionsBoundary: aws.String(*r.ko.Spec.PermissionsBoundary),
+	}
+
+	_, err = rm.sdkapi.PutRolePermissionsBoundaryWithContext(ctx, input)
+	rm.metrics.RecordAPICall("UPDATE", "PutRolePermissionsBoundary", err)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// deleteRolePermissionsBoundary calls deleteRolePermissionsBoundary to update
+// a delete a given role permissiosn boundary
+func (rm *resourceManager) deleteRolePermissionsBoundary(
+	ctx context.Context,
+	desired *resource,
+) error {
+	var err error
+	rlog := ackrtlog.FromContext(ctx)
+	exit := rlog.Trace("rm.deleteRolePermissionsBoundary")
+	defer exit(err)
+
+	dspec := desired.ko.Spec
+	input := &svcsdk.DeleteRolePermissionsBoundaryInput{
+		RoleName: aws.String(*dspec.Name),
+	}
+
+	_, err = rm.sdkapi.DeleteRolePermissionsBoundaryWithContext(ctx, input)
+	rm.metrics.RecordAPICall("UPDATE", "DeleteRolePermissionsBoundary", err)
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
 // syncPolicies examines the PolicyARNs in the supplied Role and calls the
 // ListRolePolicies, AttachRolePolicy and DetachRolePolicy APIs to ensure that
@@ -30,7 +138,8 @@ import (
 // field, which is a list of strings containing Policy ARNs.
 func (rm *resourceManager) syncPolicies(
 	ctx context.Context,
-	r *resource,
+	desired *resource,
+	latest *resource,
 ) (err error) {
 	rlog := ackrtlog.FromContext(ctx)
 	exit := rlog.Trace("rm.syncPolicies")
@@ -38,32 +147,29 @@ func (rm *resourceManager) syncPolicies(
 	toAdd := []*string{}
 	toDelete := []*string{}
 
-	existingPolicies, err := rm.getPolicies(ctx, r)
-	if err != nil {
-		return err
-	}
+	existingPolicies := latest.ko.Spec.Policies
 
-	for _, p := range r.ko.Spec.Policies {
+	for _, p := range desired.ko.Spec.Policies {
 		if !ackutil.InStringPs(*p, existingPolicies) {
 			toAdd = append(toAdd, p)
 		}
 	}
 
 	for _, p := range existingPolicies {
-		if !ackutil.InStringPs(*p, r.ko.Spec.Policies) {
+		if !ackutil.InStringPs(*p, desired.ko.Spec.Policies) {
 			toDelete = append(toDelete, p)
 		}
 	}
 
 	for _, p := range toAdd {
 		rlog.Debug("adding policy to role", "policy_arn", *p)
-		if err = rm.addPolicy(ctx, r, p); err != nil {
+		if err = rm.addPolicy(ctx, desired, p); err != nil {
 			return err
 		}
 	}
 	for _, p := range toDelete {
 		rlog.Debug("removing policy from role", "policy_arn", *p)
-		if err = rm.removePolicy(ctx, r, p); err != nil {
+		if err = rm.removePolicy(ctx, desired, p); err != nil {
 			return err
 		}
 	}
@@ -141,7 +247,8 @@ func (rm *resourceManager) removePolicy(
 // in sync with the Role.Spec.Tags
 func (rm *resourceManager) syncTags(
 	ctx context.Context,
-	r *resource,
+	desired *resource,
+	latest *resource,
 ) (err error) {
 	rlog := ackrtlog.FromContext(ctx)
 	exit := rlog.Trace("rm.syncTags")
@@ -149,19 +256,16 @@ func (rm *resourceManager) syncTags(
 	toAdd := []*svcapitypes.Tag{}
 	toDelete := []*svcapitypes.Tag{}
 
-	existingTags, err := rm.getTags(ctx, r)
-	if err != nil {
-		return err
-	}
+	existingTags := latest.ko.Spec.Tags
 
-	for _, t := range r.ko.Spec.Tags {
+	for _, t := range desired.ko.Spec.Tags {
 		if !inTags(*t.Key, *t.Value, existingTags) {
 			toAdd = append(toAdd, t)
 		}
 	}
 
 	for _, t := range existingTags {
-		if !inTags(*t.Key, *t.Value, r.ko.Spec.Tags) {
+		if !inTags(*t.Key, *t.Value, desired.ko.Spec.Tags) {
 			toDelete = append(toDelete, t)
 		}
 	}
@@ -170,7 +274,7 @@ func (rm *resourceManager) syncTags(
 		for _, t := range toAdd {
 			rlog.Debug("adding tag to role", "key", *t.Key, "value", *t.Value)
 		}
-		if err = rm.addTags(ctx, r, toAdd); err != nil {
+		if err = rm.addTags(ctx, desired, toAdd); err != nil {
 			return err
 		}
 	}
@@ -178,7 +282,7 @@ func (rm *resourceManager) syncTags(
 		for _, t := range toDelete {
 			rlog.Debug("removing tag from role", "key", *t.Key, "value", *t.Value)
 		}
-		if err = rm.removeTags(ctx, r, toDelete); err != nil {
+		if err = rm.removeTags(ctx, desired, toDelete); err != nil {
 			return err
 		}
 	}
